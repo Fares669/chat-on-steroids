@@ -22,6 +22,7 @@ export interface SteerDeps {
 const MAX_TEXT = 16_000;
 
 export async function steerFromTelegram(deps: SteerDeps, sessionId: string, text: string): Promise<'sent' | 'queued' | 'off' | 'refused' | 'failed'> {
+  // Recheck the opt-in setting for every reply; linking the bot alone never enables steering.
   if (!deps.allowed()) return 'off';
   const trimmed = text.trim().slice(0, MAX_TEXT);
   const session = await deps.session(sessionId).catch(() => null);
