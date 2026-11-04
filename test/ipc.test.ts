@@ -66,7 +66,7 @@ const {
   spawn,
   swarmStateForCaller
 } = await import('../src/main/agents.js');
-const { registerIpc, cleanSessionName } = await import('../src/main/ipc.js');
+const { registerIpc, cleanSessionName, personsMessage } = await import('../src/main/ipc.js');
 const { openInPreferredBrowser } = await import('../src/main/browser.js');
 const bridgeModule = await import('../src/main/bridge.js');
 const { app, nativeTheme, safeStorage, shell, dialog } = await import('electron');
@@ -2549,9 +2549,21 @@ describe('Stop IPC exact session and turn authority', () => {
     const session = await createSession({ title: 'Stop IPC', conversationId });
     await appendEvent(session.id, { time: Date.now(), source: 'app', kind: 'turn_start', turnId: 'ipc-stop-one' });
     expect((await invoke({ id: session.id })).ok).toBe(false);
-    expect(await invoke({ id: session.id, expectedTurnId: 'other-turn' })).toMatchObject({ ok: false, error: 'active_turn_changed' });
+    // The person reads what happened, never an error code (Haz on #1883).
+    const nothing = 'That answer had already ended; there was nothing to stop.';
+    expect(await invoke({ id: session.id, expectedTurnId: 'other-turn' })).toMatchObject({ ok: false, error: nothing });
     // A stored historical start alone cannot authorize stopping a browser turn.
-    expect(await invoke({ id: session.id, expectedTurnId: 'ipc-stop-one' })).toMatchObject({ ok: false, error: 'active_turn_changed' });
+    expect(await invoke({ id: session.id, expectedTurnId: 'ipc-stop-one' })).toMatchObject({ ok: false, error: nothing });
+    // Stop shown for another chat than the session's now (a Compact & Resume moved it): nothing here changes.
+    expect(await invoke({ id: session.id, expectedTurnId: 'ipc-stop-one', expectedConversationId: 'f3333333-aaaa-4bbb-8ccc-111111111111' })).toMatchObject({
+      ok: false, error: 'That answer had already ended, so ChatGPT was not asked to stop. Compact & Resume was already moving this chat and goes on.' });
+    // Main's own read of the controls fails meanwhile: the named chat still binds, nothing else is touched.
+    const bridge = await import('../src/main/bridge.js');
+    const read = vi.spyOn(bridge, 'sessionControlsFor').mockRejectedValueOnce(new Error('conversation_changed'));
+    expect(await invoke({ id: session.id, expectedTurnId: 'ipc-stop-one', expectedConversationId: 'f3333333-aaaa-4bbb-8ccc-111111111111' })).toMatchObject({
+      ok: false, error: 'That answer had already ended, so ChatGPT was not asked to stop. Compact & Resume was already moving this chat and goes on.' });
+    expect(read).toHaveBeenCalled();
+    read.mockRestore();
     await rebindSession(session.id, conversationId, 'f2222222-aaaa-4bbb-8ccc-111111111111');
     expect((await invoke({ id: session.id, expectedTurnId: 'ipc-stop-one' })).ok).toBe(false);
     const missing = await createSession({ title: 'No browser ownership', conversationId: null });
@@ -3315,4 +3327,15 @@ describe('phone notifications over IPC', () => {
     expect(await handlers.get('phonePush:token')!(null, { token: '' })).toMatchObject({ ok: true, data: { hasPhonePushToken: false } });
     expect(await getSecret('ntfyToken')).toBeNull();
   });
+});
+
+// #1919: only a message the person wrote carries a moved chat's folder line.
+it('tells a person\'s message from the app\'s own', () => {
+  const base = { id: 'i1', sessionId: 's1', text: 'Next step', mode: 'auto', state: 'queued' } as never as Parameters<typeof personsMessage>[0];
+  expect(personsMessage(base)).toBe(true);
+  expect(personsMessage({ ...base, scheduled: { scheduleId: 'x', dueAt: 1, late: false } } as never)).toBe(true);
+  for (const own of [{ opening: true }, { recovery: { questionId: 'q' } }, { continuedFrom: 'recovery' }, { purpose: 'decision' },
+    { purpose: 'rotation' }, { finishOwner: 'f' }, { mode: 'finish', authoredSource: 'none' }, { authoredSource: 'none' }]) expect(personsMessage({ ...base, ...own } as never)).toBe(false);
+  // A message the person wrote and queued for the finish is still theirs (CodeRabbit on #1981).
+  expect(personsMessage({ ...base, mode: 'finish', authoredSource: 'text' } as never)).toBe(true);
 });

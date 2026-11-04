@@ -37,7 +37,7 @@ import { paintWindowTheme } from './theme.js';
 import { usageOverview } from './session/usage.js';
 import { exportUsageCsv } from './session/usage-export.js';
 import { readProviderUsage } from './provider-usage.js';
-import { inputArgs, listInputs, editQueuedInput, sendQueuedInputNow, reorderQueuedInputs, setInputAutomation, configureInputDelivery, pausedBrowserHelpers, cancelFinishInputs } from './session/input.js';
+import { inputArgs, listInputs, editQueuedInput, sendQueuedInputNow, reorderQueuedInputs, setInputAutomation, configureInputDelivery, pausedBrowserHelpers, cancelFinishInputs, type InputEntry } from './session/input.js';
 import { draftOpeningMessage, onGoalChange, nativeGoalFailure } from './goal.js';
 import { cancelTaskRequest, runTaskRequest } from './task-request.js';
 import { randomUUID } from 'node:crypto';
@@ -67,8 +67,9 @@ import { confirmedPluginSchemas, pluginRefreshPublications, pluginRefreshStatuse
  */
 
 import { answerDesktopAsk, currentDesktopAsk, mirrorDesktopAsk } from './desktop-ask-window.js';
-import { app, BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, nativeTheme, shell } from 'electron';
+import { app, BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, nativeTheme, shell, type IpcMainInvokeEvent } from 'electron';
 import { repairMacOSPermissions, resetMacOSPermissions } from './computer/macos-grants.js';
+import { testLinuxScreenshotConsent } from './computer/linux-screenshot-consent.js';
 import { z } from 'zod';
 import {
   CAPABILITIES,
@@ -97,7 +98,7 @@ import { onBackgroundExecChange, runningExecProcesses, stopExecProcess } from '.
 import { keychainNoticeReady } from './keychain-notice.js';
 import { runDiagnostics } from './diagnostics.js';
 import { collectReportFacts, readRecentLog, renderDiagnosticsReport, saveDiagnosticsReport, systemFacts, memoryFacts } from './diagnostics-report.js';
-import { listSessions, readTurnTraces } from './session/store.js';
+import { clearProjectNote, listSessions, readTurnTraces } from './session/store.js';
 import { deleteSchedule, listSchedules, saveSchedule, scheduleRepeatSchema, setSchedulePaused } from './scheduled-runs.js';
 import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, logWarn, onLog } from './logger.js';
 import { markStartup } from './startup-timing.js';
@@ -107,7 +108,7 @@ import type { WorkerWorktreeCleanupOffer } from '../shared/session.js';
 import { unifiedExecManager } from './codex/manager.js';
 import { inFlightToolCalls } from './mcp/call-context.js';
 import { RESERVED_ROOT_NAMES, uniqueRootName, validateNewRoot, SandboxError, resolvePath } from './sandbox.js';
-import { addProject, addRemoteProject, createChatgptProjectFor, linkChatgptProject, unlinkChatgptProject, expireArmedProjectCreates, getSessionProject, listProjects, localProjectPath, onProjectLinkChange, projectWorkspace, removeProject, retryProjectCreate, setProjectColor, setProjectSecretsShieldOff } from './projects.js';
+import { addProject, addRemoteProject, createChatgptProjectFor, linkChatgptProject, unlinkChatgptProject, expireArmedProjectCreates, getSessionProject, listProjects, localProjectPath, moveChatWithGroup, onProjectLinkChange, projectWorkspace, relatedFolderViews, removeProject, retryProjectCreate, setProjectColor, setProjectSecretsShieldOff, setRelatedFolders } from './projects.js';
 import { createProjectEntry, listProjectDirectory, previewProjectFile, projectFileTarget, renameProjectEntry, revalidateProjectFileTarget, saveProjectTextFile, serverFileSnapshot } from './project-files.js';
 import { ProjectFileWatchSet } from './project-file-watcher.js';
 import { ProjectGitWatchSet, readProjectGitDiff, readProjectGitSnapshot } from './project-git.js';
@@ -123,7 +124,7 @@ import {
   companionDiagnostics,
   sessionInputActivity,
   recoveryHeldByCalls, recoveryInputAllowed,
-  sessionControlsFor, cancelAssistantRecovery, pickupNow, stopSessionTurn, setSessionAutomation, setSessionObjective, compactSession, resumeFromSavedSummary, cancelSessionCompaction,
+  sessionControlsFor, cancelAssistantRecovery, pickupNow, stopSessionTurn, endOwnWorkAfterStop, setSessionAutomation, setSessionObjective, compactSession, resumeFromSavedSummary, cancelSessionCompaction,
   cancelWorkerCommands,
   chatUrl,
   revealChatInBrowser,
@@ -258,6 +259,7 @@ const settingsPatch = z.object({
     cosBrowserMinimize: z.enum(['taskbar', 'tray']).optional(),
     desktopAsk: z.enum(['off', 'active', 'always']).optional(),
     desktopUnattributed: z.boolean().optional(),
+    linuxDesktopEnabled: z.boolean().optional(),
     developerMode: z.boolean().optional(),
     playfulStatus: z.boolean().optional(),
     playfulContinue: z.boolean().optional(),
@@ -491,6 +493,8 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       // None saved is off, as in desktopAsk: a stale snapshot without the field changes nothing.
       desktopUnattributed: (base.ui.desktopUnattributed === true) === (wanted.ui.desktopUnattributed === true)
         ? current.ui.desktopUnattributed : wanted.ui.desktopUnattributed,
+      linuxDesktopEnabled: (base.ui.linuxDesktopEnabled === true) === (wanted.ui.linuxDesktopEnabled === true)
+        ? current.ui.linuxDesktopEnabled : wanted.ui.linuxDesktopEnabled,
       developerMode: pick(current.ui.developerMode, base.ui.developerMode, wanted.ui.developerMode),
       playfulStatus: pick(current.ui.playfulStatus, base.ui.playfulStatus, wanted.ui.playfulStatus),
       playfulContinue: pick(current.ui.playfulContinue, base.ui.playfulContinue, wanted.ui.playfulContinue),
@@ -706,10 +710,10 @@ async function buildState(): Promise<AppState> {
 }
 
 /** Wraps a handler so a thrown error becomes a message the UI can show. */
-function handle<T>(channel: string, fn: (payload: unknown) => Promise<T>): void {
-  ipcMain.handle(channel, async (_event, payload: unknown) => {
+function handle<T>(channel: string, fn: (payload: unknown, event: IpcMainInvokeEvent) => Promise<T>): void {
+  ipcMain.handle(channel, async (event, payload: unknown) => {
     try {
-      return { ok: true as const, data: await fn(payload) };
+      return { ok: true as const, data: await fn(payload, event) };
     } catch (err) {
       const message =
         err instanceof SandboxError || err instanceof z.ZodError
@@ -744,6 +748,14 @@ export async function openSessionChat(id: string): Promise<void> {
 
 /** The Telegram bot's change listener of the current registration; a second registration replaces it. */
 let dropTelegramListener: (() => void) | null = null;
+
+/** A message the person wrote: not an automatic Continue, a Goal decision, a finish step or an opening. */
+export function personsMessage(entry: InputEntry): boolean {
+  // Who wrote it, not when it goes: a message the person queued for the finish is still theirs,
+  // while the finish's generated checkpoints carry no authored text (CodeRabbit on #1981).
+  return !entry.opening && !entry.recovery && !entry.continuedFrom && !entry.purpose && !entry.finishOwner &&
+    (entry.authoredSource ?? 'text') !== 'none';
+}
 
 export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall: () => void): void {
   registerWorkspaceTerminalIpc(getWindow);
@@ -917,6 +929,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     // reaches automatic plugin refresh. Cosmetic saves must not invalidate discovery.
     if (before.multiAgent.enabled !== next.multiAgent.enabled || before.sessions.record !== next.sessions.record ||
         before.ui.finishTool !== next.ui.finishTool ||
+        (before.ui.linuxDesktopEnabled === true) !== (next.ui.linuxDesktopEnabled === true) ||
         JSON.stringify(effectiveCapabilities(before)) !== JSON.stringify(effectiveCapabilities(next))) forgetExposedSurface();
     // Order matters, and it used to be wrong. Pausing the run and withdrawing worker browser
     // commands has to happen while the bridge can still cancel those transports; stopping the
@@ -1236,6 +1249,17 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     const session = await getSession(sessionId);
     return assignChatGroup(session ? { id: session.id, projectId: session.projectId ?? null, origin: session.origin ?? null } : null, target);
   });
+  // Move to project (#1919): the chat, its sub-agents and its group place change; nothing it does.
+  handle('sessions:moveProject', async payload => {
+    const { sessionId, projectId, groupId: target } = z.object({ sessionId: sessionIdArg.shape.id,
+      projectId: z.string().min(1).max(160).nullable(), groupId: groupId.nullable().optional() }).strict().parse(payload);
+    const { from, fromGroup, moved, groups } = await moveChatWithGroup(sessionId, projectId, target);
+    // The moved chats' own summaries: a row from older history is not on the newest page the
+    // sidebar rereads, and a move does not change its place in the list (CodeRabbit on #1965).
+    const summaries = (await Promise.all([...new Set([sessionId, ...moved])].map(id => getSession(id))))
+      .filter((summary): summary is NonNullable<typeof summary> => !!summary);
+    return { from, fromGroup, groups, summaries };
+  });
   handle('pets:list', async () => petLibraryState());
   handle('pets:overlayState', async () => petOverlayControlState());
   handle('pets:overlayVisible', async payload => {
@@ -1420,6 +1444,19 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     logInfo(`secrets shield: turned ${off ? 'off' : 'back on'} for a project's chats`);
     push('session:changed');
     return project;
+  });
+  // Related folders (#1689): context for a project's chats, chosen from approved folders only.
+  handle('projects:related', async payload => {
+    const { id } = z.object({ id: z.string().uuid() }).strict().parse(payload);
+    const project = (await listProjects()).find(row => row.id === id);
+    if (!project) throw new Error('Project not found');
+    return relatedFolderViews(project);
+  });
+  handle('projects:related-set', async payload => {
+    const { id, folders } = z.object({ id: z.string().uuid(), folders: z.array(z.string().min(1).max(32768)).max(40) }).strict().parse(payload);
+    const project = await setRelatedFolders(id, folders);
+    push('session:changed');
+    return relatedFolderViews(project);
   });
   handle('projects:color', async payload => {
     const { id, color } = z.object({ id: z.string().uuid(), color: z.enum(PROJECT_COLORS).nullable() }).strict().parse(payload);
@@ -1781,6 +1818,36 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     await refreshMacOSDesktopAccess({ promptAccessibility: true });
     return buildState();
   });
+  // A user action inside the focused main window is necessary for GNOME's Screenshot
+  // portal to display its consent dialog. Never synthesize a grant or send image bytes
+  // to the renderer. This is a diagnostic probe, not a general-purpose screen IPC.
+  let linuxScreenshotConsentPending = false;
+  handle('desktop:linuxScreenshotConsent', async (_payload, event) => {
+    // A different renderer must not borrow the main window's foreground state
+    // to trigger an operating-system access dialog.
+    const window = getWindow();
+    if (!window || window.isDestroyed() || event.sender !== window.webContents) {
+      logInfo('linux screenshot consent: refused because the request was not from the main window');
+      throw new Error('Screenshot permission can be requested only from the Chat On Steroids main window.');
+    }
+    if (linuxScreenshotConsentPending) {
+      logInfo('linux screenshot consent: refused because another request is already running');
+      throw new Error('A screenshot permission request is already running.');
+    }
+    linuxScreenshotConsentPending = true;
+    try {
+      return await testLinuxScreenshotConsent({
+        focused: () => {
+          const window = getWindow();
+          return !!window && !window.isDestroyed() && window.isFocused();
+        },
+        enabled: () => getConfig().ui.linuxDesktopEnabled === true,
+        screenAllowed: () => effectiveCapabilities(getConfig()).screen === true
+      });
+    } finally {
+      linuxScreenshotConsentPending = false;
+    }
+  });
   // A grant from an earlier build no longer applies, yet System Settings shows it on: reset this
   // app's own entries and ask again, so macOS files the grant under the build running now.
   handle('desktop:repairPermissions', async () => {
@@ -1985,8 +2052,28 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     return (await stageFiles([{ text }]))[0]!;
   });
   handle('sessions:stopTurn', async payload => {
-    const { id, expectedTurnId } = sessionIdArg.extend({ expectedTurnId: z.string().min(1).max(256) }).parse(payload);
-    return stopSessionTurn(id, expectedTurnId);
+    const { id, expectedTurnId, expectedConversationId } = sessionIdArg.extend({ expectedTurnId: z.string().min(1).max(256),
+      expectedConversationId: z.string().min(1).max(256).optional() }).parse(payload);
+    // The chat and its Goal or Loop as Stop found them, before any of it changes. The window names the
+    // chat it showed Stop for: a Compact & Resume that moved the session since is not that chat (CodeRabbit on #2066).
+    const found = await sessionControlsFor(id).catch(() => null);
+    // A failed read is no licence to act on whatever chat the session shows now: the named chat still binds,
+    // and Goal or Loop that could not be read is not counted as stopped (CodeRabbit on #2066).
+    const before = found ? { ...found, conversationId: expectedConversationId ?? found.conversationId }
+      : expectedConversationId ? { conversationId: expectedConversationId, automation: 'off' as const } : null;
+    try {
+      return await stopSessionTurn(id, expectedTurnId);
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== 'active_turn_changed') throw error;
+      // The answer Stop showed for is no longer running: the app's own work still stops (Haz on #1883),
+      // and the person reads what happened, not an error code.
+      const outcome = await endOwnWorkAfterStop(id, expectedTurnId, before);
+      throw new Error(outcome.resumeGoesOn
+        ? 'That answer had already ended, so ChatGPT was not asked to stop. Compact & Resume was already moving this chat and goes on.'
+        : outcome.ended
+          ? "That answer had already ended, so ChatGPT was not asked to stop. This chat's automatic work is stopped."
+          : 'That answer had already ended; there was nothing to stop.');
+    }
   });
   handle('sessions:releaseFinish', async (payload) => {
     const { id, expectedTurnId } = sessionIdArg.extend({ expectedTurnId: z.string().min(1).max(256) }).parse(payload);
@@ -2573,7 +2660,12 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       });
     },
     changed: () => push('session:changed'),
-    recordDelivered: (entry, anchorCommitted) => getConfig().sessions.record ? recordDeliveredInput(entry, anchorCommitted) : Promise.resolve(true),
+    recordDelivered: async (entry, anchorCommitted) => {
+      // The message that named a moved chat's folder went out: no other one repeats it (#1919).
+      if (entry.sessionId && personsMessage(entry) && (await getSession(entry.sessionId))?.projectNotePending)
+        await clearProjectNote(entry.sessionId).catch(error => logWarn(`projects: could not mark the folder note sent for ${entry.sessionId}: ${String(error)}`));
+      return getConfig().sessions.record ? recordDeliveredInput(entry, anchorCommitted) : true;
+    },
     prepareText: async (entry, limits, authored) => {
       const control = entry.conversationId ? goalSwitchFor(entry.conversationId) : getConfig().goal;
       const mode = entry.automation ?? (control.enabled ? control.mode : 'off');
@@ -2584,7 +2676,9 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       // An edit of a chat's first question (#365) replaces the message that carried its setup.
       return ((entry.opening || !entry.sessionId) && !entry.conversationId && !entry.finishOwner && entry.mode !== 'finish') || entry.editFramed
         ? prepareSessionPrompt(text, entry, limits, authored)
-        : !entry.finishOwner && entry.purpose !== 'decision' ? prepareSkillFollowup(text, authored, limits, entry) : text;
+        : !entry.finishOwner && entry.purpose !== 'decision'
+          ? prepareSkillFollowup(text, authored, limits, entry, personsMessage(entry) && !!entry.sessionId && (await getSession(entry.sessionId))?.projectNotePending === true)
+          : text;
     },
     applyAutomation: async (conversationId, automation, phase, objective, loopAfterTurn) => {
       // This message supersedes the old final; never pick that old final up merely
